@@ -1,0 +1,314 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: 17}
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: 8.7}
+      - name: Create project
+        run: |
+          mkdir USMarketWidget && cd USMarketWidget
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.usmarket"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.usmarket"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="@string/app_name" android:icon="@android:drawable/ic_menu_recent_history">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".MarketWidget" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                          <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                          <action android:name="android.intent.action.TIME_SET" />
+                      </intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/usmarket
+          cat > app/src/main/java/com/example/usmarket/MainActivity.kt <<'EOF'
+          package com.example.usmarket
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val t = TextView(this)
+                  t.text = "เพิ่มวิดเจ็ต US Market ได้จากหน้าจอโฮม: กดค้างที่หน้าจอ แล้วเลือก วิดเจ็ต"
+                  t.textSize = 18f
+                  t.setPadding(48, 96, 48, 48)
+                  setContentView(t)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/usmarket
+          cat > app/src/main/java/com/example/usmarket/Market.kt <<'EOF'
+          package com.example.usmarket
+
+          import android.graphics.Color
+          import java.time.*
+
+          object Market {
+              val ET: ZoneId = ZoneId.of("America/New_York")
+              val TH: ZoneId = ZoneId.of("Asia/Bangkok")
+
+              // ชื่อวันหยุด to ปิดทั้งวัน (true) หรือปิดก่อนเวลา 13:00 ET (false)
+              // ข้อมูลจากความจำ ควรตรวจกับปฏิทิน NYSE ก่อนใช้จริง
+              val H: Map<String, Pair<String, Boolean>> = mapOf(
+                  "2026-11-26" to ("Thanksgiving" to true),
+                  "2026-11-27" to ("หลัง Thanksgiving" to false),
+                  "2026-12-24" to ("คริสต์มาสอีฟ" to false),
+                  "2026-12-25" to ("คริสต์มาส" to true),
+                  "2027-01-01" to ("ปีใหม่" to true),
+                  "2027-01-18" to ("MLK" to true),
+                  "2027-02-15" to ("Presidents' Day" to true),
+                  "2027-03-26" to ("Good Friday" to true),
+                  "2027-05-31" to ("Memorial Day" to true),
+                  "2027-06-18" to ("Juneteenth (ชดเชย)" to true),
+                  "2027-07-05" to ("วันชาติ (ชดเชย)" to true),
+                  "2027-09-06" to ("Labor Day" to true),
+                  "2027-11-25" to ("Thanksgiving" to true),
+                  "2027-11-26" to ("หลัง Thanksgiving" to false),
+                  "2027-12-24" to ("คริสต์มาส (ชดเชย)" to true)
+              )
+
+              val label = mapOf("pre" to "ก่อนตลาดเปิด (Pre-market)", "reg" to "ตลาดเปิดปกติ",
+                  "aft" to "หลังตลาดปิด (After-hours)", "cls" to "ตลาดปิด")
+              val next = mapOf("pre" to "Pre-market เริ่ม", "reg" to "ตลาดเปิด",
+                  "aft" to "ตลาดปิด → After-hours", "cls" to "After-hours สิ้นสุด")
+              val color = mapOf("pre" to Color.parseColor("#E0A800"), "reg" to Color.parseColor("#17B890"),
+                  "aft" to Color.parseColor("#7B7BF0"), "cls" to Color.parseColor("#8896A8"))
+
+              class Day(val date: LocalDate, val early: Boolean) {
+                  private fun t(h: Int, m: Int) = ZonedDateTime.of(date, LocalTime.of(h, m), ET).toInstant()
+                  val pre = t(4, 0)
+                  val reg = t(9, 30)
+                  val aft = if (early) t(13, 0) else t(16, 0)
+                  val cls = if (early) t(17, 0) else t(20, 0)
+              }
+
+              fun days(now: Instant): List<Day> {
+                  val d0 = now.atZone(ET).toLocalDate()
+                  return (-1..20L).map { d0.plusDays(it) }.filter {
+                      it.dayOfWeek != DayOfWeek.SATURDAY && it.dayOfWeek != DayOfWeek.SUNDAY &&
+                          H[it.toString()]?.second != true
+                  }.map { Day(it, H[it.toString()] != null) }
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/usmarket
+          cat > app/src/main/java/com/example/usmarket/MarketWidget.kt <<'EOF'
+          package com.example.usmarket
+
+          import android.app.AlarmManager
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.SystemClock
+          import android.widget.RemoteViews
+          import java.time.Duration
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.format.DateTimeFormatter
+          import java.util.Locale
+
+          class MarketWidget : AppWidgetProvider() {
+
+              override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) = refresh(c, m, ids)
+
+              override fun onReceive(c: Context, i: Intent) {
+                  super.onReceive(c, i)
+                  if (i.action == ACTION_TICK || i.action == Intent.ACTION_TIMEZONE_CHANGED || i.action == "android.intent.action.TIME_SET") {
+                      val m = AppWidgetManager.getInstance(c)
+                      refresh(c, m, m.getAppWidgetIds(ComponentName(c, MarketWidget::class.java)))
+                  }
+              }
+
+              private fun refresh(c: Context, m: AppWidgetManager, ids: IntArray) {
+                  if (ids.isEmpty()) return
+                  val now = Instant.now()
+                  val ds = Market.days(now)
+                  val ev = ds.flatMap { listOf(it.pre to "pre", it.reg to "reg", it.aft to "aft", it.cls to "cls") }.sortedBy { it.first }
+                  var cur = "cls"
+                  var nx: Pair<Instant, String>? = null
+                  for (e in ev) { if (!e.first.isAfter(now)) cur = e.second else { nx = e; break } }
+
+                  val hm = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
+                  val thWd = DateTimeFormatter.ofPattern("EEE HH:mm", Locale("th", "TH"))
+                  val v = RemoteViews(c.packageName, R.layout.widget)
+
+                  v.setTextViewText(R.id.st, Market.label[cur])
+                  v.setTextColor(R.id.st, Market.color[cur]!!)
+
+                  if (nx != null) {
+                      val remain = Duration.between(now, nx.first).toMillis()
+                      v.setChronometerCountDown(R.id.cd, true)
+                      v.setChronometer(R.id.cd, SystemClock.elapsedRealtime() + remain, null, true)
+                      v.setTextViewText(R.id.nx, "ถัดไป: ${Market.next[nx.second]} · ไทย ${thWd.format(nx.first.atZone(Market.TH))}")
+                      schedule(c, nx.first.plusSeconds(2))
+                  }
+
+                  val d = ds.firstOrNull { it.cls.isAfter(now) }
+                  if (d != null) {
+                      val today = now.atZone(Market.ET).toLocalDate() == d.date
+                      v.setTextViewText(R.id.dt, (if (today) "วันนี้" else "วันซื้อขายถัดไป ${d.date}") + (if (d.early) " · ปิดก่อนเวลา" else ""))
+                      val rows = listOf(
+                          Triple(R.id.r1, "Pre-market", d.pre to d.reg),
+                          Triple(R.id.r2, "ตลาดปกติ", d.reg to d.aft),
+                          Triple(R.id.r3, "After-hours", d.aft to d.cls)
+                      )
+                      for ((id, name, r) in rows) {
+                          val s = r.first.atZone(Market.TH)
+                          val e = r.second.atZone(Market.TH)
+                          val plus = if (e.toLocalDate() != s.toLocalDate()) " (+1)" else ""
+                          v.setTextViewText(id, "$name  ${hm.format(r.first.atZone(Market.ET))}–${hm.format(r.second.atZone(Market.ET))} ET  |  ${hm.format(s)}–${hm.format(e)}$plus ไทย")
+                          val on = !now.isBefore(r.first) && now.isBefore(r.second)
+                          v.setInt(id, "setBackgroundColor", if (on) Color.parseColor("#33FFFFFF") else Color.TRANSPARENT)
+                      }
+                  }
+
+                  val today = LocalDate.now(Market.ET)
+                  val hk = Market.H.keys.sorted().firstOrNull { LocalDate.parse(it) >= today }
+                  if (hk != null) {
+                      val n = Duration.between(today.atStartOfDay(), LocalDate.parse(hk).atStartOfDay()).toDays()
+                      val h = Market.H[hk]!!
+                      v.setTextViewText(R.id.hl, "วันหยุดถัดไป: ${h.first} ($hk) ${if (h.second) "ปิดทั้งวัน" else "ปิด 13:00 ET"} · ${if (n == 0L) "วันนี้" else "อีก $n วัน"}")
+                  }
+                  for (id in ids) m.updateAppWidget(id, v)
+              }
+
+              private fun schedule(c: Context, at: Instant) {
+                  val i = Intent(c, MarketWidget::class.java).setAction(ACTION_TICK)
+                  val pi = PendingIntent.getBroadcast(c, 0, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  (c.getSystemService(Context.ALARM_SERVICE) as AlarmManager).set(AlarmManager.RTC_WAKEUP, at.toEpochMilli(), pi)
+              }
+
+              companion object { const val ACTION_TICK = "com.example.usmarket.TICK" }
+          }
+          EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/bg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android">
+              <solid android:color="#F20E1420" />
+              <corners android:radius="24dp" />
+          </shape>
+          EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/widget.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:padding="14dp"
+              android:background="@drawable/bg">
+
+              <TextView android:id="@+id/st" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:text="US Market" android:textSize="17sp" android:textStyle="bold" android:textColor="#17B890" />
+              <Chronometer android:id="@+id/cd" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:textSize="34sp" android:textStyle="bold" android:textColor="#E8EDF5" />
+              <TextView android:id="@+id/nx" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:textSize="11sp" android:textColor="#9AA7BA" />
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:orientation="horizontal" android:layout_marginTop="8dp" android:layout_marginBottom="6dp">
+                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+                      android:text="ไทย" android:textSize="11sp" android:textColor="#9AA7BA" />
+                  <TextClock android:id="@+id/thc" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:timeZone="Asia/Bangkok" android:format24Hour="HH:mm:ss" android:format12Hour="HH:mm:ss"
+                      android:textSize="14sp" android:textColor="#E8EDF5" />
+                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+                      android:gravity="end" android:text="นิวยอร์ก" android:textSize="11sp" android:textColor="#9AA7BA" />
+                  <TextClock android:id="@+id/nyc" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp"
+                      android:timeZone="America/New_York" android:format24Hour="HH:mm:ss" android:format12Hour="HH:mm:ss"
+                      android:textSize="14sp" android:textColor="#E8EDF5" />
+              </LinearLayout>
+
+              <TextView android:id="@+id/dt" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:textSize="11sp" android:textColor="#9AA7BA" />
+              <TextView android:id="@+id/r1" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:padding="5dp" android:textSize="12sp" android:textColor="#E8EDF5" />
+              <TextView android:id="@+id/r2" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:padding="5dp" android:textSize="12sp" android:textColor="#E8EDF5" />
+              <TextView android:id="@+id/r3" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:padding="5dp" android:textSize="12sp" android:textColor="#E8EDF5" />
+              <TextView android:id="@+id/hl" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp" android:textSize="11sp" android:textColor="#9AA7BA" />
+          </LinearLayout>
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">US Market</string>
+              <string name="widget_desc">เวลาตลาดหุ้นสหรัฐ นับถอยหลังและตารางช่วงซื้อขาย</string>
+          </resources>
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/widget_info.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp" android:minHeight="190dp"
+              android:targetCellWidth="4" android:targetCellHeight="3"
+              android:updatePeriodMillis="1800000"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"
+              android:description="@string/widget_desc"
+              android:initialLayout="@layout/widget"
+              android:previewLayout="@layout/widget" />
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "USMarketWidget"
+          include(":app")
+          EOF
+      - run: cd USMarketWidget && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: us-market-apk
+          path: USMarketWidget/app/build/outputs/apk/debug/app-debug.apk
